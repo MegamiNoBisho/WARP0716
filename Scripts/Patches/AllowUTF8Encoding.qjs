@@ -21,7 +21,7 @@
 *                                                                          *
 *   Author(s)     : Hanashi                                                *
 *   Created Date  : 2026-08-10                                             *
-*   Last Modified : 2026-09-03                                             *
+*   Last Modified : 2026-09-06                                             *
 *                                                                          *
 *   Target        : 2022-04-06 & 2025 Ragexe (verified), 2021+ clients     *
 *                                                                          *
@@ -31,18 +31,11 @@
 /// \brief Make the client speak UTF-8 end to end - decoding, layout, input and
 ///        colored emoji - in one patch.
 ///
-///        This supersedes the four separate patches EnableUTF8Text,
-///        EnableUTF8Layout, EnableUTF8Input and UseEmojiSprite. They were
-///        always meant to be applied together: each one fixes a different
-///        stage of the same pipeline, and any one of them alone leaves a
-///        visible defect behind. Merging them also removes the ordering
-///        question, since all four now share a single tag and a single set of
-///        allocations.
-///
 ///        THE FOUR STAGES
 ///        ---------------
 ///          1. DECODE  - text arriving from data files and the server is
-///                       interpreted as UTF-8 instead of the ANSI codepage.
+///                       interpreted as UTF-8 when it actually is UTF-8, and
+///                       left on the client's own codepage when it is not.
 ///          2. LAYOUT  - the "step one character" primitive walks whole
 ///                       UTF-8 sequences instead of single bytes.
 ///          3. INPUT   - text you type or paste is encoded as UTF-8 on its
@@ -83,17 +76,73 @@
 ///            * the text MEASURE path  (string width / wrapping)
 ///            * the text DRAW path     (actual glyph output)
 ///
-///        So a single 6-byte edit - making the helper return 65001 (CP_UTF8)
-///        unconditionally - switches the entire visible text pipeline to
-///        UTF-8 at once, with no other subsystem affected. Measurement and
-///        drawing stay in perfect agreement because they share the helper,
-///        which is what prevents the mis-aligned/overlapping text you get
-///        when only one of the two is patched.
+///        Making that helper return 65001 (CP_UTF8) unconditionally would
+///        switch the entire visible text pipeline to UTF-8 in one 6-byte edit.
+///        That is too blunt: the pipeline
+///        carries UTF-8 and legacy text at the same time. A translated .lub
+///        saved as UTF-8 and an original Korean .lub still in CP949 both reach
+///        the same conversion, as do msgstringtable, iteminfo, character names
+///        off the wire and every server chat line. Forcing CP_UTF8 renders the
+///        UTF-8 ones correctly and turns the CP949 ones into replacement
+///        characters.
+///
+///        The decision has to be made per string, and the resolver cannot make
+///        it - it only receives a BYTE charset and never sees the text. So the
+///        resolver is left completely intact, still producing its genuine
+///        codepage, and a sniffer is installed one level down at the
+///        conversion sites, where the string pointer is live:
+///
+///            Utf8IfWellFormed(cp, flags, bytes, cb, wide, cch)
+///              scan `bytes`
+///                well-formed UTF-8 with at least one multi-byte sequence
+///                                 -> overwrite cp with CP_UTF8
+///                anything else    -> leave cp alone
+///              jmp MultiByteToWideChar        ; tail jump, caller's own frame
+///
+///        It has the identical signature to the API it fronts and nothing is
+///        pushed before the tail jump, so the genuine MultiByteToWideChar sees
+///        the caller's frame and runs its own 'ret 18h'. The only thing that
+///        ever changes is the codepage argument in the caller's stack slot.
+///
+///        WHY SNIFFING IS DECISIVE HERE
+///        -----------------------------
+///        UTF-8 is a self-validating encoding, and the legacy codepages this
+///        client ships with are not. A CP949 or Big5 string collides with the
+///        UTF-8 grammar almost immediately, because its trail bytes span
+///        0x41-0xFE while UTF-8 continuation bytes are confined to 0x80-0xBF;
+///        CP874 and CP1252 are single-byte, so any high byte at all is a stray
+///        continuation byte. The validator is deliberately strict - overlong
+///        forms, UTF-16 surrogates and anything past U+10FFFF are all rejected -
+///        because its whole job is to tell these apart, and every form UTF-8
+///        forbids is a form a legacy codepage is free to produce.
+///
+///        Two deliberate non-decisions:
+///
+///          * PURE ASCII keeps the resolver's codepage. ASCII is byte-identical
+///            in UTF-8 and in every codepage here, so both answers render the
+///            same glyphs - there is nothing to gain by claiming it, and
+///            leaving it alone keeps the untranslated majority of the client
+///            on exactly the path it has always taken.
+///          * A TRUNCATED sequence at the end of the scanned window is not
+///            treated as malformed. The scan stops on the verdict it already
+///            has instead of punishing a string for being cut off.
+///
+///        The one irreducible case is a two-byte legacy string whose bytes
+///        happen to form a valid UTF-8 sequence - a narrow slice of the CP949
+///        hangul block does. Two bytes offer nothing further to contradict the
+///        reading, so no amount of scanning can resolve it. Real text is longer
+///        than that and gives itself away.
+///
+///        Measurement and drawing stay in perfect agreement because both sites
+///        get the same sniffer and therefore reach the same verdict for the
+///        same bytes - which is what prevents the mis-aligned/overlapping text
+///        you get when only one of the two is patched.
 ///
 ///        Why it is safe:
 ///          1. Both callers pass dwFlags = 0. CP_UTF8 *requires* flags to be
 ///             0 (or MB_ERR_INVALID_CHARS); a non-zero flag would make the
-///             call fail outright. They already comply.
+///             call fail outright. They already comply, and the sniffer
+///             double-checks it at runtime and stands down if it ever does not.
 ///          2. Both callers use MultiByteToWideChar - the DECODE direction
 ///             only. The encode direction (WideCharToMultiByte), which has
 ///             the lpDefaultChar/lpUsedDefaultChar restriction under CP_UTF8,
@@ -103,12 +152,25 @@
 ///             from the byte length remains large enough. No overflow risk.
 ///          4. Pure ASCII is byte-identical in UTF-8, so all existing English
 ///             text is completely unaffected.
+///          5. Legacy .lub, iteminfo and msgstringtable files that were never
+///             converted keep decoding exactly as they do unpatched. Mixing
+///             converted and unconverted data files is fine - the choice is
+///             per string, not per client.
 ///
 ///        The resolver is identified purely by shape, so if a future client
 ///        ever produced a second function with the same prologue there would
 ///        be no way to tell which one drives the text pipeline. Rather than
 ///        guess and silently corrupt every string in the game, the patch
 ///        refuses when the signature is not unique.
+///
+///        The conversions are then found the other way round - every
+///        MultiByteToWideChar call sitting in a function that also calls the
+///        resolver - which is what keeps the sniffer off conversions belonging
+///        to other subsystems. Fewer than two of those is fatal: measure and
+///        draw must both be covered or text is laid out with one width and
+///        painted at another. More than two is accepted, because the sniffer is
+///        conservative by construction and an extra site fed by the same
+///        resolver simply reaches the same correct verdict.
 ///
 ///
 ///        STAGE 2 - CHARACTER STEPPING
@@ -336,14 +398,11 @@
 ///
 ///        WHAT ENDS A GROUP IS TIME, NOT A PASS COUNT
 ///        -------------------------------------------
-///        The first version of this counted matches and freed the slot on the
-///        fifth one. That is only correct for a caller that draws exactly five
-///        times. Unoutlined callers draw once and drop-shadow callers draw
-///        twice, so their entry was still live when the next frame began - the
-///        next frame's first pass then matched it and was suppressed, and the
-///        emoji vanished for that frame. That is what made the chatbox blink.
-///
-///        So the slot carries a timestamp instead of a counter. The passes of
+///        The slot carries a timestamp rather than a pass counter, because a
+///        counter is only correct for a caller that draws exactly five times:
+///        unoutlined callers draw once and drop-shadow callers draw twice, so
+///        their entry would still be live when the next frame began and the
+///        next frame's first pass would be wrongly suppressed. The passes of
 ///        one group are consecutive calls microseconds apart; the next frame is
 ///        milliseconds away. An entry only matches if it is key-equal AND was
 ///        touched within one group lifetime - QueryPerformanceFrequency / 500,
@@ -447,15 +506,17 @@
 ///        This patch governs how the client ENCODES and DECODES text. It does
 ///        not re-encode your data files for you: msgstringtable.txt, iteminfo,
 ///        NPC dialogs from the server and so on must actually be saved as
-///        UTF-8 to benefit. Your server must also pass the bytes through
-///        untouched; nothing here changes the chat packet format or its length
-///        limits.
+///        UTF-8 to benefit - stage 1 detects UTF-8, it does not create it.
+///        Files left on their original codepage keep rendering the way they do
+///        unpatched, so a half-translated data folder is perfectly fine. Your
+///        server must also pass the bytes through untouched; nothing here
+///        changes the chat packet format or its length limits.
 ///
 ///        Whether a non-emoji character appears at all still depends on the
 ///        selected GDI font containing that glyph - GDI has no automatic font
 ///        fallback. Emoji bypass that entirely once their sprite exists.
 ///
-AllowUTF8Enconding = function(_)
+AllowUTF8Encoding = function(_)
 {
 	//=====================================================================//
 	// Locate everything FIRST. Nothing is written until every stage that   //
@@ -463,15 +524,8 @@ AllowUTF8Enconding = function(_)
 	// half matches is never left half patched.                            //
 	//=====================================================================//
 
-	$$(_, 1.1, `Locate the DISPLAY charset -> codepage resolver`)
-	const dispMatches = Exe.FindHexN(this.TextResolverSig);
-	if (dispMatches.length === 0)
-		throw Error("AllowUTF8Enconding: display codepage resolver not found");
-
-	if (dispMatches.length > 1)
-		throw Error("AllowUTF8Enconding: display resolver is ambiguous (" + dispMatches.length + " matches)");
-
-	const dispAddr = dispMatches[0];
+	$$(_, 1.1, `Locate the DISPLAY resolver and the conversions it feeds`)
+	const disp = this.findDisplay();
 
 	$$(_, 1.2, `Locate every reference to the two character stepping APIs`)
 	const layout = this.findLayout();
@@ -486,24 +540,32 @@ AllowUTF8Enconding = function(_)
 	Exe.BeginTag("UTF8_Encoding", true);
 
 	//=====================================================================//
-	// STAGE 1 - decode displayed text as UTF-8                            //
+	// STAGE 1 - decode displayed text as UTF-8 when it IS UTF-8            //
 	//=====================================================================//
 	//
-	// The function is __cdecl with a single argument (callers clean the
-	// stack with "add esp,4"), so a bare RET is correctly balanced. We do
-	// not need to build a stack frame just to return a constant, which is
-	// why the original "push ebp / mov ebp, esp" is simply dropped.
+	// The resolver itself is deliberately left alone. Its genuine codepage is
+	// what every string that is not UTF-8 keeps being decoded with, which is
+	// the entire point - the sniffer only ever upgrades a verdict, never
+	// replaces one.
 	//
-	// These 6 bytes replace the first 6 of the prologue (push ebp / mov ebp,
-	// esp / mov eax,[ebp+8]). Everything after - the range check and the
-	// whole jump-table dispatch - simply becomes unreachable. Nothing is
-	// relocated, so the file layout and all surrounding code are untouched.
-	//
-	$$(_, 3, `Force the display resolver to return CP_UTF8`)
-	Exe.SetHex(dispAddr,
-		" B8 E9 FD 00 00" //mov eax, 65001
-	+	" C3"             //ret
-	);
+	$$(_, 3.1, `Allocate the UTF-8 sniffer and lay it down`)
+	const sniffCode = this.SniffCode;
+	const [sniffPhy, sniffVir] = Exe.Allocate(sniffCode.byteCount(), 0x10);
+	Exe.SetHex(sniffPhy, sniffCode);
+
+	$$(_, 3.2, `Patch the sentinel dword to the real import slot`)
+	/// The sniffer tail-jumps through the client's own import table, so the
+	/// genuine API runs on the caller's frame and cleans up after itself.
+	for (const [off, name] of this.SniffFixups)
+		Exe.SetUint32(sniffPhy + off, disp.slots[name]);
+
+	$$(_, 3.3, `Route every anchored conversion through the sniffer`)
+	/// 'call dword ptr [<&MultiByteToWideChar>]' (6 bytes) -> 'call rel32' (5)
+	/// + NOP. The import thunk is left untouched on purpose: the client
+	/// compares GDI32 slots against GetProcAddress results, and rewriting an
+	/// IAT entry is what that check exists to catch.
+	for (const addr of disp.convCalls)
+		Exe.SetCALL(addr, sniffVir, 1);
 
 	//=====================================================================//
 	// STAGE 2 - UTF-8 aware character stepping                            //
@@ -659,6 +721,12 @@ AllowUTF8Enconding = function(_)
 		/// the call itself are touched - the following instruction is untouched.
 		Exe.SetCALL(emoji.drawCall, codeVir + this.EmojiEntryTextOut, 1);
 		Exe.SetCALL(emoji.measureCall, codeVir + this.EmojiEntryMeasure, 1);
+
+		$$(_, 6.10, `Ask whether the supporting grf should be copied over on apply`)
+		/// The grf carries the data\emoji sprites this stage draws from, so the
+		/// question is only worth asking when the sprite path actually went in.
+		if (!Warp.TestMode)
+			Exe.GetUserInput('$copyEmojiGrf', D_Bool, "Copy Emoji Grf", "Do you want the supporting Grf file copied to <b>'client'</b> folder when patch is applied?", true);
 	}
 
 	Exe.EndTag();
@@ -683,13 +751,143 @@ AllowUTF8Enconding = function(_)
 ///        unmistakable - it is the only charset-range test of its kind that
 ///        reads its argument directly.
 ///
-AllowUTF8Enconding.TextResolverSig =
+AllowUTF8Encoding.TextResolverSig =
 	  " 55"             //push ebp
 	+ " 8B EC"          //mov ebp, esp
 	+ " 8B 45 08"       //mov eax, [ebp+8]
 	+ " 83 C0 80"       //add eax, -80h
 	+ " 83 F8 6E"       //cmp eax, 6Eh
 	;
+
+///
+/// \brief Locate the display resolver and the conversions it feeds.
+///
+///        The resolver is not patched - it is only the anchor. What gets
+///        patched is every 'call dword ptr [<&MultiByteToWideChar>]' sitting in
+///        a function that also calls the resolver, which on the verified
+///        clients is the text MEASURE and text DRAW paths. Anchoring this way
+///        is what keeps the sniffer off conversions belonging to other
+///        subsystems, which have no business being second-guessed.
+///
+///        Fewer than two anchored sites means measure and draw would not both
+///        be covered, and a client where only one of the pair is patched lays
+///        text out with one width and paints it at another - strictly worse
+///        than not patching at all. So that throws. More than two is accepted:
+///        the sniffer is conservative by construction, so an extra site fed by
+///        the same resolver simply reaches the same correct verdict.
+///
+AllowUTF8Encoding.findDisplay = function()
+{
+	$$('AllowUTF8Encoding.findDisplay', 1, `Locate the resolver - the anchor, not a patch target`)
+	const matches = Exe.FindHexN(this.TextResolverSig);
+	if (matches.length === 0)
+		throw Error("AllowUTF8Encoding: display codepage resolver not found");
+
+	if (matches.length > 1)
+		throw Error("AllowUTF8Encoding: display resolver is ambiguous (" + matches.length + " matches)");
+
+	const resolver = matches[0];
+
+	$$('AllowUTF8Encoding.findDisplay', 2, `Resolve the conversion API`)
+	const {funcAddr} = GetImpRefs('MultiByteToWideChar', "KERNEL32.dll");
+	if (funcAddr < 0)
+		throw Error("AllowUTF8Encoding: MultiByteToWideChar is not imported");
+
+	$$('AllowUTF8Encoding.findDisplay', 3, `Keep only the conversions the resolver feeds`)
+	const resolverVir = this.Fn2Vir(resolver);
+	const convCalls = Exe.FindHexN( CALL([funcAddr]) )
+	                  .filter(addr => this.fedByResolver(addr, resolverVir));
+
+	if (convCalls.length < 2)
+		throw Error("AllowUTF8Encoding: expected the measure & draw conversions, found "
+		          + convCalls.length);
+
+	return {
+		resolver,
+		convCalls,
+		slots : {MultiByteToWideChar : funcAddr},
+	};
+};
+
+///
+/// \brief Whether the function containing addr also calls the display
+///        resolver - i.e. whether the codepage reaching this conversion is the
+///        one the resolver produced.
+///
+///        Bounded by spanOf() (stage 2's helper - the INT3 padding walk) rather
+///        than a fixed byte window, because the resolver call and the
+///        conversion can sit far apart: the codepage is fetched once and the
+///        arguments in between are pushed by whatever the caller needs. The
+///        whole function is searched, not just the part above the conversion,
+///        since a hoisted or loop-rotated fetch can end up below it.
+///
+///        Erring wide is the right failure mode. A conversion wrongly included
+///        still gets a conservative verdict from the sniffer, whereas one
+///        wrongly excluded is a text path left on the old behaviour.
+///
+AllowUTF8Encoding.fedByResolver = function(addr, resolverVir)
+{
+	const [from, to] = this.spanOf(addr);
+
+	/// Stop 5 bytes short so the rel32 read below always stays inside the span
+	/// a 0xE8 at the very end could not be a whole CALL anyway.
+	for (const site of Exe.FindHexN(CALL(), from, to - 5))
+	{
+		/// rel32 is measured from the end of the CALL instruction. A stray 0xE8
+		/// that is not really a call simply fails to match - the check reads
+		/// only, so a false candidate costs nothing.
+		if (this.Fn2Vir(site + 5) + Exe.GetInt32(site + 1) === resolverVir)
+			return true;
+	}
+
+	return false;
+};
+
+///
+/// \brief The UTF-8 sniffer. The sentinel dword (E1..) is replaced with the
+///        real import slot address by the fixup pass above.
+///
+///        Signature is identical to MultiByteToWideChar, which it tail-jumps to
+///        on every path. The only side effect is the codepage argument in the
+///        caller's own stack slot, and only when the bytes really are UTF-8.
+///
+AllowUTF8Encoding.SniffCode =
+	  "83 7C 24 08 00 0F 85 A1 01 00 00 8B 4C 24 0C 85 "
+	+ "C9 0F 84 95 01 00 00 8B 54 24 10 85 D2 78 08 81 "
+	+ "FA 00 04 00 00 76 05 BA 00 04 00 00 53 56 31 F6 "
+	+ "31 DB 39 D6 0F 83 60 01 00 00 0F B6 04 31 85 C0 "
+	+ "0F 84 54 01 00 00 3D 80 00 00 00 72 29 3D C2 00 "
+	+ "00 00 0F 82 52 01 00 00 3D F5 00 00 00 0F 83 47 "
+	+ "01 00 00 3D E0 00 00 00 72 0F 3D F0 00 00 00 72 "
+	+ "33 E9 B4 00 00 00 46 EB B9 8D 46 02 39 D0 0F 87 "
+	+ "16 01 00 00 80 7C 31 01 80 0F 82 1B 01 00 00 80 "
+	+ "7C 31 01 BF 0F 87 10 01 00 00 83 C6 02 BB 01 00 "
+	+ "00 00 EB 8E 8D 46 03 39 D0 0F 87 EB 00 00 00 0F "
+	+ "B6 04 31 3D E0 00 00 00 74 1F 3D ED 00 00 00 74 "
+	+ "30 80 7C 31 01 80 0F 82 DE 00 00 00 80 7C 31 01 "
+	+ "BF 0F 87 D3 00 00 00 EB 2E 80 7C 31 01 A0 0F 82 "
+	+ "C6 00 00 00 80 7C 31 01 BF 0F 87 BB 00 00 00 EB "
+	+ "16 80 7C 31 01 80 0F 82 AE 00 00 00 80 7C 31 01 "
+	+ "9F 0F 87 A3 00 00 00 80 7C 31 02 80 0F 82 98 00 "
+	+ "00 00 80 7C 31 02 BF 0F 87 8D 00 00 00 83 C6 03 "
+	+ "BB 01 00 00 00 E9 08 FF FF FF 8D 46 04 39 D0 77 "
+	+ "69 0F B6 04 31 3D F0 00 00 00 74 17 3D F4 00 00 "
+	+ "00 74 20 80 7C 31 01 80 72 60 80 7C 31 01 BF 77 "
+	+ "59 EB 1E 80 7C 31 01 90 72 50 80 7C 31 01 BF 77 "
+	+ "49 EB 0E 80 7C 31 01 80 72 40 80 7C 31 01 8F 77 "
+	+ "39 80 7C 31 02 80 72 32 80 7C 31 02 BF 77 2B 80 "
+	+ "7C 31 03 80 72 24 80 7C 31 03 BF 77 1D 83 C6 04 "
+	+ "BB 01 00 00 00 E9 98 FE FF FF 85 DB 5E 5B 74 0C "
+	+ "C7 44 24 04 E9 FD 00 00 EB 02 5E 5B FF 25 00 00 "
+	+ "00 E1 "
+	;
+
+///
+/// \brief Every sentinel dword in the sniffer, as [offset, import name].
+///
+AllowUTF8Encoding.SniffFixups = [
+	[0x1AE, 'MultiByteToWideChar'],
+];
 
 //=========================================================================//
 // STAGE 2 - character stepping                                            //
@@ -711,7 +909,7 @@ AllowUTF8Enconding.TextResolverSig =
 ///        code path keeps stepping single bytes, which is the very defect this
 ///        stage exists to fix.
 ///
-AllowUTF8Enconding.spanOf = function(addr)
+AllowUTF8Encoding.spanOf = function(addr)
 {
 	const pad = INT3.repeat(2);
 
@@ -734,7 +932,7 @@ AllowUTF8Enconding.spanOf = function(addr)
 ///        Returns null when neither import is present or nothing references
 ///        them - there would be nothing to fix in that case.
 ///
-AllowUTF8Enconding.findLayout = function()
+AllowUTF8Encoding.findLayout = function()
 {
 	const slots = {};
 	const found = {};
@@ -769,8 +967,8 @@ AllowUTF8Enconding.findLayout = function()
 	/// merely reads the slot - a comparison, a copy into a structure - must
 	/// keep seeing the genuine address, so it is left alone.
 	const loads = [];
-	for (const [name, entry] of [['CharNextExA', AllowUTF8Enconding.LayoutEntryNext],
-	                             ['CharPrevExA', AllowUTF8Enconding.LayoutEntryPrev]])
+	for (const [name, entry] of [['CharNextExA', AllowUTF8Encoding.LayoutEntryNext],
+	                             ['CharPrevExA', AllowUTF8Encoding.LayoutEntryPrev]])
 	{
 		for (const [addr, size] of found[name].loads)
 		{
@@ -815,7 +1013,7 @@ AllowUTF8Enconding.findLayout = function()
 ///             from the store, so the two instructions are provably about the
 ///             same slot rather than merely a plausible one.
 ///
-AllowUTF8Enconding.feedsCall = function(addr, size, reg)
+AllowUTF8Encoding.feedsCall = function(addr, size, reg)
 {
 	const [from, to] = this.spanOf(addr);
 
@@ -845,11 +1043,10 @@ AllowUTF8Enconding.feedsCall = function(addr, size, reg)
 };
 
 ///
-/// \brief The two stepping routines. Generated & verified by utf8_stub_gen.py -
-///        the sentinel dwords (E1..) are replaced with the real import slot
-///        addresses by the fixup pass above.
+/// \brief The two stepping routines. The sentinel dwords (E1..) are replaced
+///        with the real import slot addresses by the fixup pass above.
 ///
-AllowUTF8Enconding.LayoutCode =
+AllowUTF8Encoding.LayoutCode =
 	  "8B 44 24 04 3D A4 03 00 00 0F 84 57 01 00 00 3D "
 	+ "A8 03 00 00 0F 84 4C 01 00 00 3D B5 03 00 00 0F "
 	+ "84 41 01 00 00 3D B6 03 00 00 0F 84 36 01 00 00 "
@@ -901,14 +1098,14 @@ AllowUTF8Enconding.LayoutCode =
 ///
 /// \brief Every sentinel dword in the stepping code, as [offset, import name].
 ///
-AllowUTF8Enconding.LayoutFixups = [
+AllowUTF8Encoding.LayoutFixups = [
 	[0x168, 'CharNextExA'],
 	[0x267, 'CharPrevExA'],
 ];
 
 /// Entry point offsets within the stepping blob
-AllowUTF8Enconding.LayoutEntryNext = 0x000;
-AllowUTF8Enconding.LayoutEntryPrev = 0x16C;
+AllowUTF8Encoding.LayoutEntryNext = 0x000;
+AllowUTF8Encoding.LayoutEntryPrev = 0x16C;
 
 //=========================================================================//
 // STAGE 3 - input & clipboard                                             //
@@ -919,7 +1116,7 @@ AllowUTF8Enconding.LayoutEntryPrev = 0x16C;
 ///        Distinct from the display resolver - the input variant calls
 ///        LangIDToCharset first, so the prologue differs.
 ///
-AllowUTF8Enconding.InputResolverSig =
+AllowUTF8Encoding.InputResolverSig =
 	  " 55 8B EC"           //push ebp / mov ebp, esp
 	+ " FF 75 08"           //push [ebp+8]
 	+ " E8 ?? ?? ?? ??"     //call LangIDToCharset
@@ -935,7 +1132,7 @@ AllowUTF8Enconding.InputResolverSig =
 ///        it varies by build, which means this shape alone is too loose -
 ///        findInput() below narrows it down properly.
 ///
-AllowUTF8Enconding.InputFallbackSig =
+AllowUTF8Encoding.InputFallbackSig =
 	  " A1 ?? ?? ?? ??"    //mov eax, [defaultCodepage]
 	+ " 89 ?? 90 00 00 00" //mov [reg+90h], eax
 	;
@@ -944,7 +1141,7 @@ AllowUTF8Enconding.InputFallbackSig =
 /// \brief Convert a physical match address to the virtual address of the
 ///        function starting there.
 ///
-AllowUTF8Enconding.Fn2Vir = phy => Exe.Phy2Vir(phy, CODE);
+AllowUTF8Encoding.Fn2Vir = phy => Exe.Phy2Vir(phy, CODE);
 
 ///
 /// \brief Locate everything stage 3 needs: the input resolver, its fallback
@@ -957,14 +1154,14 @@ AllowUTF8Enconding.Fn2Vir = phy => Exe.Phy2Vir(phy, CODE);
 ///        else missing means the shape is not what we understand, and that
 ///        throws rather than half applying.
 ///
-AllowUTF8Enconding.findInput = function()
+AllowUTF8Encoding.findInput = function()
 {
 	const matches = Exe.FindHexN(this.InputResolverSig);
 	if (matches.length === 0)
 		return null;
 
 	if (matches.length > 1)
-		throw Error("AllowUTF8Enconding: input resolver is ambiguous (" + matches.length + " matches)");
+		throw Error("AllowUTF8Encoding: input resolver is ambiguous (" + matches.length + " matches)");
 
 	const resolver = matches[0];
 
@@ -974,14 +1171,14 @@ AllowUTF8Enconding.findInput = function()
 	/// above it, which is the whole point of the if/else being patched here.
 	const fallbacks = this.findFallbacks(this.Fn2Vir(resolver));
 	if (fallbacks.length === 0)
-		throw Error("AllowUTF8Enconding: default codepage fallback loads not found");
+		throw Error("AllowUTF8Encoding: default codepage fallback loads not found");
 
 	const slots = {};
 	for (const [name, dll] of this.InputImports)
 	{
 		const {funcAddr} = GetImpRefs(name, dll);
 		if (funcAddr < 0)
-			throw Error(`AllowUTF8Enconding: ${name} is not imported`);
+			throw Error(`AllowUTF8Encoding: ${name} is not imported`);
 
 		slots[name] = funcAddr;
 	}
@@ -993,7 +1190,7 @@ AllowUTF8Enconding.findInput = function()
 	+	CALL([slots['GetClipboardData']])   //call dword ptr [&GetClipboardData]
 	);
 	if (pasteAddr < 0)
-		throw Error("AllowUTF8Enconding: clipboard paste site not found");
+		throw Error("AllowUTF8Encoding: clipboard paste site not found");
 
 	/// Sits a few instructions past the fetch, after the NULL check on the
 	/// returned handle. Bounded search so an unrelated GlobalLock elsewhere
@@ -1003,7 +1200,7 @@ AllowUTF8Enconding.findInput = function()
 		pasteAddr, pasteAddr + 0x20
 	);
 	if (lockAddr < 0)
-		throw Error("AllowUTF8Enconding: GlobalLock call after paste not found");
+		throw Error("AllowUTF8Encoding: GlobalLock call after paste not found");
 
 	return {resolver, fallbacks, slots, pasteAddr, lockAddr};
 };
@@ -1019,7 +1216,7 @@ AllowUTF8Enconding.findInput = function()
 ///        patched is its else. Walking back for that call is both
 ///        register-agnostic and immune to the global's address changing.
 ///
-AllowUTF8Enconding.findFallbacks = function(resolverVir)
+AllowUTF8Encoding.findFallbacks = function(resolverVir)
 {
 	const out = [];
 
@@ -1049,7 +1246,7 @@ AllowUTF8Enconding.findFallbacks = function(resolverVir)
 ///        by the client, so nothing is added to the PE - only the slot
 ///        addresses are looked up.
 ///
-AllowUTF8Enconding.InputImports = [
+AllowUTF8Encoding.InputImports = [
 	['GetClipboardData', 'USER32.dll'],
 	['GlobalLock', 'KERNEL32.dll'],
 	['WideCharToMultiByte', 'KERNEL32.dll'],
@@ -1061,14 +1258,14 @@ AllowUTF8Enconding.InputImports = [
 ///        distance that always fits - UTF-8 needs at most 3 bytes per unit
 ///        (a surrogate pair is 2 units -> 4 bytes, i.e. 2 bytes/unit).
 ///
-AllowUTF8Enconding.InputBufSize = 0x1000;
+AllowUTF8Encoding.InputBufSize = 0x1000;
 
 ///
 /// \brief Fixup table for the paste stub - dword sentinels replaced with
 ///        real addresses after allocation. Each entry is [offset, kind, ref],
 ///        where kind is 'imp' (import slot ref) or 'buf' (scratch buffer ref).
 ///
-AllowUTF8Enconding.InputFixups = [
+AllowUTF8Encoding.InputFixups = [
 	[0x009, 'imp', 'GlobalLock'],
 	[0x035, 'buf', 'buf'],
 	[0x044, 'imp', 'WideCharToMultiByte'],
@@ -1082,10 +1279,7 @@ AllowUTF8Enconding.InputFixups = [
 ///        UTF-16 to UTF-8, returns a pointer to the UTF-8 buffer. Signature
 ///        is stdcall/ret 4, identical to GlobalLock itself.
 ///
-///        Generated by Python/utf8_input_stub_gen.py - edit the source
-///        there and regenerate rather than patching the hex by hand.
-///
-AllowUTF8Enconding.InputCode =
+AllowUTF8Encoding.InputCode =
 	  "55 89 E5 56 FF 75 08 FF 15 00 00 00 E1 85 C0 74 "
 	+ "52 89 C6 31 C9 81 F9 55 05 00 00 73 0A 66 83 3C "
 	+ "4E 00 74 03 41 EB EE 85 C9 74 2E 6A 00 6A 00 68 "
@@ -1106,7 +1300,7 @@ AllowUTF8Enconding.InputCode =
 ///        the stub assumes the client's own stdcall frame - or when any of the
 ///        APIs it calls is not imported.
 ///
-AllowUTF8Enconding.findEmoji = function()
+AllowUTF8Encoding.findEmoji = function()
 {
 	const drawFn = GetImpRefs("TextOutW", "GDI32.dll");
 	if (drawFn.funcAddr < 0)
@@ -1161,7 +1355,7 @@ AllowUTF8Enconding.findEmoji = function()
 ///             newest clients the two have been merged into one function, so a
 ///             candidate that IS the helper is accepted as well.
 ///
-AllowUTF8Enconding.findFileMgr = function()
+AllowUTF8Encoding.findFileMgr = function()
 {
 	if (!DGRF.MovFMgr)
 	{
@@ -1187,7 +1381,7 @@ AllowUTF8Enconding.findFileMgr = function()
 	if (funcAddr < 0)
 		return null;
 
-	$$('AllowUTF8Enconding.findFileMgr', 1, `Find the disk-read helper by its CreateFileA argument block`)
+	$$('AllowUTF8Encoding.findFileMgr', 1, `Find the disk-read helper by its CreateFileA argument block`)
 	const readSig =
 		PUSH_0                     //push 0                    ; hTemplateFile
 	+	PUSH(0x80)                 //push 80h                   ; FILE_ATTRIBUTE_NORMAL
@@ -1210,7 +1404,7 @@ AllowUTF8Enconding.findFileMgr = function()
 	if (readers.isEmpty())
 		return null;
 
-	$$('AllowUTF8Enconding.findFileMgr', 2, `Pick the method that dispatches to it with g_fileMgr as 'this'`)
+	$$('AllowUTF8Encoding.findFileMgr', 2, `Pick the method that dispatches to it with g_fileMgr as 'this'`)
 	for (const addr of Exe.FindHexN( MOV(ECX, obj) ))
 	{
 		/// The CALL always follows within a few instructions - the arguments are
@@ -1238,9 +1432,7 @@ AllowUTF8Enconding.findFileMgr = function()
 };
 
 ///
-/// \brief Offsets of the hand-seeded fields inside the data block. Mirrors the
-///        D table in emoji_stub_gen.py - change it there, not here, and
-///        re-generate.
+/// \brief Offsets of the hand-seeded fields inside the data block.
 ///
 ///          CACHE     64 slots x 0x10 : cp, hdcSrc, w, h
 ///          QPCTHRESH ticks one draw group may span; 0 = not resolved yet,
@@ -1251,7 +1443,7 @@ AllowUTF8Enconding.findFileMgr = function()
 ///          FMGRGET   CFileMgr::Get
 ///          SIZEOUT   size out-param handed to CFileMgr::Get
 ///
-AllowUTF8Enconding.EmojiOffsets = {
+AllowUTF8Encoding.EmojiOffsets = {
 	PFNBLEND  : 0x000,
 	WSPACE    : 0x008,
 	SIZEBUF   : 0x010,
@@ -1269,11 +1461,11 @@ AllowUTF8Enconding.EmojiOffsets = {
 };
 
 ///
-/// \brief The sprite stub itself. Generated & verified by emoji_stub_gen.py -
-///        the sentinel dwords (E0.. data block, E1.. import slots) are replaced
-///        with real addresses by the fixup pass above.
+/// \brief The sprite stub itself. The sentinel dwords (E0.. data block,
+///        E1.. import slots) are replaced with real addresses by the fixup
+///        pass above.
 ///
-AllowUTF8Enconding.EmojiCode =
+AllowUTF8Encoding.EmojiCode =
 	  "55 89 E5 83 EC 30 53 56 57 C7 45 E4 01 00 00 00 "
 	+ "8B 75 14 85 F6 74 26 8B 4D 18 83 F9 00 7E 1E 31 "
 	+ "FF 8B 4D 18 E8 F0 03 00 00 52 89 C1 E8 39 04 00 "
@@ -1422,7 +1614,7 @@ AllowUTF8Enconding.EmojiCode =
 ///        'imp'  -> replace with the IAT slot address of that function.
 ///        'data' -> replace with dataVir + offset into the data block.
 ///
-AllowUTF8Enconding.EmojiFixups = [
+AllowUTF8Encoding.EmojiFixups = [
 	[0x04E, 'imp', 'TextOutW'],
 	[0x063, 'data', 0x10],
 	[0x06A, 'data', 0x8],
@@ -1514,7 +1706,7 @@ AllowUTF8Enconding.EmojiFixups = [
 ///        imported by every client this patch supports. It is also what
 ///        CFileMgr::Get hands back, so both load paths free the same way.
 ///
-AllowUTF8Enconding.EmojiImports = [
+AllowUTF8Encoding.EmojiImports = [
 	['TextOutW', 'GDI32.dll'],
 	['GetTextExtentPoint32W', 'GDI32.dll'],
 	['CreateCompatibleDC', 'GDI32.dll'],
@@ -1538,7 +1730,7 @@ AllowUTF8Enconding.EmojiImports = [
 ///
 /// \brief Literal strings placed into the data block, as [offset, hex].
 ///
-AllowUTF8Enconding.EmojiStrings = [
+AllowUTF8Encoding.EmojiStrings = [
 	[0x168, "64 61 74 61 5C 65 6D 6F 6A 69 5C 25 58 2E 62 6D 70 00"],  // data\emoji\%X.bmp
 	[0x17C, "6D 73 69 6D 67 33 32 2E 64 6C 6C 00"],  // msimg32.dll
 	[0x188, "41 6C 70 68 61 42 6C 65 6E 64 00"],  // AlphaBlend
@@ -1547,13 +1739,13 @@ AllowUTF8Enconding.EmojiStrings = [
 ];
 
 /// Entry point offsets within the sprite blob
-AllowUTF8Enconding.EmojiEntryTextOut = 0x000;
-AllowUTF8Enconding.EmojiEntryMeasure = 0x2F4;
+AllowUTF8Encoding.EmojiEntryTextOut = 0x000;
+AllowUTF8Encoding.EmojiEntryMeasure = 0x2F4;
 
 /// Size of the writable data block (0x1B0 header + 64 cache slots * 0x10
 /// + the group-lifetime threshold and its QPC scratch + 8 dedup slots * 0x18
 /// + the file manager pointers and the size out-param)
-AllowUTF8Enconding.EmojiDataSize = 0x690;
+AllowUTF8Encoding.EmojiDataSize = 0x690;
 
 ///
 /// \brief Only for clients that convert text through a charset -> codepage
@@ -1565,5 +1757,27 @@ AllowUTF8Enconding.EmojiDataSize = 0x690;
 ///        skipped individually when the client cannot take them, so this stays
 ///        applicable to every client that can benefit from any part of it.
 ///
-AllowUTF8Enconding.validate = () =>
-	Exe.FindHex(AllowUTF8Enconding.TextResolverSig) > 0;
+AllowUTF8Encoding.validate = () =>
+	Exe.FindHex(AllowUTF8Encoding.TextResolverSig) > 0;
+
+///
+/// \brief Extra steps when the patch is applied (Copy the Grf file if requested)
+///
+AllowUTF8Encoding.onApplied = function()
+{
+	if (Warp.TestMode || !Exe.GetSavedInput('$copyEmojiGrf'))
+		return;
+
+	const _ = 'AllowUTF8Encoding.onApplied';
+
+	$$(_, 1.1, `Prepare the directory paths`)
+	const srcDir = Warp.Path + "Inputs";
+	const tgtDir = System.DirPath(Warp.TgtExe);
+
+	$$(_, 2, `Copy the grf file to the target directory (overwriting the existing ones)`)
+	for (const name of
+	[
+		"emoji"
+	])
+		System.Copy(srcDir + "/" + name + ".grf", tgtDir, true);
+};

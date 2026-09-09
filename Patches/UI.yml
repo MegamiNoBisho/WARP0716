@@ -511,8 +511,8 @@ TextRendering:
     mutex : false
 
     patches:
-        - AllowUTF8Enconding:
+        - AllowUTF8Encoding:
             title : Allow UTF-8 encoding
             recommend : no
             author : Hanashi
-            desc : Makes the client support UTF-8 for text rendering, layout, input, clipboard, and colored emoji. Handles multi-byte and complex emoji correctly without breaking text layout. Emoji can be displayed using 32-bit BMP sprites from data\emoji\<CODEPOINT-HEX>.bmp. Unsupported clients automatically skip incompatible stages. Data files must be UTF-8, and the server must preserve UTF-8 bytes.
+            desc : Makes the client speak UTF-8 end to end - text display, layout, typing/pasting and colored emoji sprites. Data files must actually be saved as UTF-8 to benefit.
